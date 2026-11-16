@@ -21,7 +21,7 @@
 
 ## 快速使用
 
-1. 使用 **Forward+** Universal Renderer，启用 Render Graph，关闭 MSAA。
+1. 使用 **Forward+** Universal Renderer，启用 Render Graph，关闭 MSAA。(目前支持Forward+,Deferred,Deferred+)
 2. 在该 Renderer Data 添加并启用 **Virtual Mesh Model Render Feature**，让目标相机使用这个 Renderer。
 3. 在 Project 中选择静态 FBX、Prefab 或已保存的 Mesh，执行 **Assets > Virtual Mesh > Bake Model Clusters**。
 4. 将发布出的 Prefab 放入场景。输出位于 `Assets/VirtualMeshModels/`；首次 Bake 后，源资产重导入会自动更新。
