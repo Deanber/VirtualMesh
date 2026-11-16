@@ -1,0 +1,27 @@
+{
+  "name": "com.unity.virtualmesh",
+  "displayName": "Virtual Mesh",
+  "description": "Bake imported models into reusable Virtual Mesh assets and prefabs. Render instanced model clusters with GPU-driven LOD, occlusion culling and budgeted residency.",
+  "version": "0.4.0-preview.2",
+  "unity": "6000.3",
+  "dependencies": {
+    "com.unity.render-pipelines.universal": "17.3.0",
+    "com.unity.shadergraph": "17.3.0",
+    "com.unity.mathematics": "1.3.3"
+  },
+  "keywords": [
+    "graphics",
+    "rendering",
+    "render",
+    "virtualmesh",
+    "cluster",
+    "culling"
+  ],
+  "samples": [
+    {
+      "displayName": "ElectricDreams material adapters",
+      "description": "Optional source and Virtual Mesh shaders for the supported forest material conventions. Models, textures and scenes are not included.",
+      "path": "Samples~/ElectricDreamsAdapters"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "name": "Unity.VirtualMesh.Editor",
+  "rootNamespace": "",
+  "references": [
+    "Unity.VirtualMesh.Runtime",
+    "Unity.RenderPipelines.Universal.Runtime"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": true,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

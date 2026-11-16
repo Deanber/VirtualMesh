@@ -1,0 +1,63 @@
+#pragma kernel CopyDepth
+#pragma kernel ReduceDepth
+#pragma kernel TestOcclusion
+#pragma multi_compile_local _ VM_HIZ_FINE_4X4
+#pragma target 4.5
+
+#include "VirtualMeshModelOcclusion.hlsl"
+
+Texture2D<float> _VMHiZDepthSource; // single-sample raw device depth
+RWTexture2D<float> _VMHiZSource;    // previous mip UAV view; avoids overlapping full SRV / mip UAV bindings
+RWTexture2D<float> _VMHiZDestination; // one destination mip UAV
+int2 _VMHiZSourceSize;
+int2 _VMHiZDestinationSize;
+int _VMHiZCopyYFlip;               // usually zero; explicit for differently oriented source copies
+
+[numthreads(8, 8, 1)]
+void CopyDepth(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (any(dispatchId.xy >= uint2(_VMHiZDestinationSize))) return;
+    int2 sourcePixel = int2(dispatchId.xy);
+    if (_VMHiZCopyYFlip != 0) sourcePixel.y = _VMHiZSourceSize.y - 1 - sourcePixel.y;
+    float depth = VMHiZClearDepth();
+    if (all(sourcePixel >= 0) && all(sourcePixel < _VMHiZSourceSize))
+        depth = VMHiZSanitizeDepth(_VMHiZDepthSource.Load(int3(sourcePixel, 0)));
+    _VMHiZDestination[dispatchId.xy] = depth;
+}
+
+[numthreads(8, 8, 1)]
+void ReduceDepth(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint2 targetSize = uint2(_VMHiZDestinationSize);
+    if (any(dispatchId.xy >= targetSize) || any(_VMHiZSourceSize <= 0)) return;
+    uint2 sourceSize = uint2(_VMHiZSourceSize);
+    // Texture mip dimensions use floor, not ceil. For odd sizes, reduce every
+    // source texel overlapping this destination's normalized footprint. The
+    // shared edge texel is intentionally included in both adjacent outputs;
+    // a 2x2-only reduction would miss the last row/column or break UV coverage.
+    uint2 begin = (dispatchId.xy * sourceSize) / targetSize;
+    uint2 end = ((dispatchId.xy + 1u) * sourceSize + targetSize - 1u) / targetSize;
+    end = min(end, sourceSize);
+    float farthest = _VMHiZReversedZ != 0 ? 1.0 : 0.0;
+    [loop] for (uint y = begin.y; y < end.y; y++)
+    {
+        [loop] for (uint x = begin.x; x < end.x; x++)
+            farthest = VMHiZFarthestDepth(farthest,
+                VMHiZSanitizeDepth(_VMHiZSource[uint2(x, y)]));
+    }
+    _VMHiZDestination[dispatchId.xy] = farthest;
+}
+
+// A model-independent GPU fixture for validating the exact production helper.
+// The runtime cull kernels include the same helper and own their append lists.
+StructuredBuffer<float4> _VMHiZTestSpheres;
+RWStructuredBuffer<uint> _VMHiZTestResults;
+int _VMHiZTestCount;
+
+[numthreads(64, 1, 1)]
+void TestOcclusion(uint3 dispatchId : SV_DispatchThreadID)
+{
+    if (dispatchId.x >= (uint)_VMHiZTestCount) return;
+    float4 sphere = _VMHiZTestSpheres[dispatchId.x];
+    _VMHiZTestResults[dispatchId.x] = VMHiZSphereOccluded(sphere.xyz, sphere.w) ? 1u : 0u;
+}

@@ -1,0 +1,26 @@
+# This source distribution intentionally omits Unity metadata.
+*.meta
+
+# Local Unity projects, caches and generated assets do not belong in this package.
+/Library/
+/Temp/
+/Obj/
+/Logs/
+/UserSettings/
+/Assets/
+/ProjectSettings/
+/Packages/
+/Build/
+/Builds/
+.vs/
+.idea/
+*.csproj
+*.sln
+*.slnx
+*.user
+*.pdb
+*.mdb
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

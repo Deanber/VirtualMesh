@@ -1,0 +1,71 @@
+#pragma kernel Prepare
+#pragma kernel Build
+#pragma target 5.0
+#include "VirtualMeshModelTypes.hlsl"
+
+StructuredBuffer<uint> _VMSourceArguments, _VMVisibleRangeCounters, _VMCanonicalCorners;
+StructuredBuffer<uint2> _VMVisibleClusters;
+StructuredBuffer<VMCluster> _VMClusters;
+StructuredBuffer<VMInstance> _VMInstances;
+RWStructuredBuffer<uint> _VMIndexedArguments, _VMFallbackArguments, _VMIndexDispatchArguments, _VMIndexDiagnostics;
+RWByteAddressBuffer _VMIndexedIndices;
+uint _VMIndexCapacityClusters, _VMIndexRecovered, _VMIndexDiagnosticOffset;
+uint _VMIndexBatch, _VMIndexOutputStart;
+
+[numthreads(1, 1, 1)]
+void Prepare(uint3 id : SV_DispatchThreadID)
+{
+    uint count = _VMSourceArguments[1];
+    uint start = _VMIndexRecovered != 0 ? _VMVisibleRangeCounters[0] : 0;
+    // Each index reserves eight low bits for a canonical cluster corner.
+    // Capacity/encoding overflow takes the unchanged procedural draw instead.
+    bool fits = count <= _VMIndexCapacityClusters && start <= 0x1000000u && count <= 0x1000000u - start;
+    uint indexedCount = fits ? count : 0;
+    // Materials own disjoint argument slots and index slices, allowing all
+    // builders to finish before a single raster pass consumes the whole group.
+    uint indexedBase = _VMIndexBatch * 5;
+    uint fallbackBase = _VMIndexBatch * 4;
+    uint dispatchBase = _VMIndexBatch * 3;
+    _VMIndexedArguments[indexedBase] = indexedCount * 192;
+    _VMIndexedArguments[indexedBase + 1] = 1;
+    _VMIndexedArguments[indexedBase + 2] = _VMIndexOutputStart;
+    _VMIndexedArguments[indexedBase + 3] = _VMIndexedArguments[indexedBase + 4] = 0;
+    _VMFallbackArguments[fallbackBase] = _VMSourceArguments[0];
+    _VMFallbackArguments[fallbackBase + 1] = fits ? 0 : count;
+    _VMFallbackArguments[fallbackBase + 2] = _VMSourceArguments[2];
+    _VMFallbackArguments[fallbackBase + 3] = _VMSourceArguments[3];
+    _VMIndexDispatchArguments[dispatchBase] = max(1u, min(indexedCount, 65535u));
+    _VMIndexDispatchArguments[dispatchBase + 1] = max(1u, (indexedCount + 65534u) / 65535u);
+    _VMIndexDispatchArguments[dispatchBase + 2] = 1;
+    _VMIndexDiagnostics[_VMIndexDiagnosticOffset] = count;
+    _VMIndexDiagnostics[_VMIndexDiagnosticOffset + 1] = indexedCount;
+    _VMIndexDiagnostics[_VMIndexDiagnosticOffset + 2] = fits ? 0 : count;
+    _VMIndexDiagnostics[_VMIndexDiagnosticOffset + 3] = start;
+}
+
+uint Canonical(uint cluster, uint corner, uint indexCount)
+{
+    if (corner >= indexCount) return 0; // Same degenerate padding as VMFetchLocalVertex.
+    uint packed = _VMCanonicalCorners[cluster * 48 + (corner >> 2)];
+    return (packed >> ((corner & 3) * 8)) & 255;
+}
+
+[numthreads(64, 1, 1)]
+void Build(uint3 group : SV_GroupID, uint triangleIndex : SV_GroupIndex)
+{
+    uint slot = group.x + group.y * 65535u;
+    uint count = _VMIndexedArguments[_VMIndexBatch * 5] / 192;
+    if (slot >= count) return;
+    uint start = _VMIndexRecovered != 0 ? _VMVisibleRangeCounters[0] : 0;
+    uint absoluteSlot = slot + start;
+    uint2 visible = _VMVisibleClusters[absoluteSlot];
+    uint indexCount = _VMClusters[visible.x].indexCount;
+    bool mirror = _VMInstances[visible.y].parameters.z < 0;
+    uint corner = triangleIndex * 3;
+    uint3 canonical = uint3(Canonical(visible.x, corner, indexCount),
+        Canonical(visible.x, corner + (mirror ? 2 : 1), indexCount),
+        Canonical(visible.x, corner + (mirror ? 1 : 2), indexCount));
+    // OutputStart addresses the index buffer only; encoded vertices still name
+    // the absolute slot in this material's original visibility buffer.
+    _VMIndexedIndices.Store3((_VMIndexOutputStart + slot * 192 + corner) * 4, (absoluteSlot << 8) | canonical);
+}

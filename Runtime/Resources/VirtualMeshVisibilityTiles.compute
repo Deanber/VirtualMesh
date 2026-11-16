@@ -1,0 +1,38 @@
+#pragma kernel BuildTileMasks
+#pragma target 5.0
+
+Texture2D<uint4> _VMVisibilityTexture;
+RWStructuredBuffer<uint2> _VMVisibilityTileMasks;
+int4 _VMVisibilityTileDimensions;
+
+groupshared uint materialMaskLow;
+groupshared uint materialMaskHigh;
+
+[numthreads(8, 8, 1)]
+void BuildTileMasks(uint3 group : SV_GroupID, uint3 lane : SV_GroupThreadID, uint laneIndex : SV_GroupIndex)
+{
+    if (laneIndex == 0)
+    {
+        materialMaskLow = 0;
+        materialMaskHigh = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint2 pixel = group.xy * 16u + lane.xy * 2u;
+    [unroll] for (uint y = 0; y < 2u; y++)
+    {
+        [unroll] for (uint x = 0; x < 2u; x++)
+        {
+            uint2 samplePixel = pixel + uint2(x, y);
+            if (any(samplePixel >= (uint2)_VMVisibilityTileDimensions.xy)) continue;
+            uint id = (_VMVisibilityTexture.Load(int3(samplePixel, 0)).z >> 7u) & 0xffffffu;
+            if (id == 0u || id > 64u) continue;
+            uint bit = id - 1u;
+            if (bit < 32u) InterlockedOr(materialMaskLow, 1u << bit);
+            else InterlockedOr(materialMaskHigh, 1u << (bit - 32u));
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (laneIndex == 0)
+        _VMVisibilityTileMasks[group.y * (uint)_VMVisibilityTileDimensions.z + group.x] = uint2(materialMaskLow, materialMaskHigh);
+}

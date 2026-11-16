@@ -1,0 +1,249 @@
+#pragma kernel Select
+#pragma kernel Retest
+#pragma kernel PrepareRetest
+#pragma kernel BuildDrawArguments
+#pragma kernel BuildRetestedDrawArguments
+#pragma kernel Shadow
+#pragma multi_compile_local _ VM_HIZ_FINE_4X4
+#pragma target 5.0
+#include "VirtualMeshModelTypes.hlsl"
+#include "VirtualMeshModelCone.hlsl"
+#include "VirtualMeshModelOcclusion.hlsl"
+
+struct VMGraphModel { uint4 offsets; float4 boundsCenter; };
+struct VMWorkItem { uint clusterStart, count, instanceId, modelId, boundsIndex; };
+struct VMWorkBounds { float4 centerRadius, extents; };
+StructuredBuffer<VMCluster> _VMClusters;
+StructuredBuffer<VMCullingData> _VMCullingData;
+StructuredBuffer<VMInstance> _VMInstances;
+StructuredBuffer<float2> _VMLodParameters;
+StructuredBuffer<uint> _VMInstanceModelIds;
+StructuredBuffer<VMGraphModel> _VMModelTable;
+StructuredBuffer<VMWorkItem> _VMWorkItems;
+StructuredBuffer<VMWorkBounds> _VMWorkBounds;
+RWStructuredBuffer<uint2> _VMVisibleClusters;
+RWStructuredBuffer<uint2> _VMDeferredClusters;
+StructuredBuffer<uint2> _VMDeferredInput;
+RWStructuredBuffer<uint> _VMRetestDispatchArguments;
+RWStructuredBuffer<uint> _VMCounters;
+RWStructuredBuffer<uint> _VMDrawArguments, _VMRecoveredArguments;
+uint _VMListCapacity, _VMArgumentPhase;
+uint _VMWorkItemCount, _VMWorkItemOffset;
+uint _VMCullMode, _VMConeDataEnabled;
+uint _VMEnableEarlyWorkFrustum;
+// Diagnostic isolation only. Zero is the normal path; geometry residency stays
+// intact while a profiling tool measures one model without re-uploading the atlas.
+int _VMDiagnosticModelMode, _VMDiagnosticModelId;
+uint2 _VMDiagnosticExcludedModelBits;
+float _VMWindPadding;
+float4 _VMFrustumPlanes[6];
+float4 _VMCameraPosition, _VMCameraForward, _VMLodParams;
+uint _VMShadowLightCount;
+float4 _VMShadowReceiverPlanes[6], _VMShadowLightDirections[16], _VMShadowLightPositionsRanges[16];
+groupshared uint vmWorkOutsideFrustum;
+
+float Transition(float error, float spacing, float pixelError, float target)
+{
+    float regular = error / max(0.000001, pixelError);
+    return target <= 0 || spacing <= 0 ? regular : min(regular, max(regular * 0.5, spacing / target));
+}
+bool Selected(VMCluster c, float instanceStretch, float2 lodParameters, float3 center, float radius, bool shadow)
+{
+    float d = shadow ? distance(center, _VMCameraPosition.xyz) : dot(center - _VMCameraPosition.xyz, _VMCameraForward.xyz);
+    float units = (_VMLodParams.y > .5 ? 1.0 : max(_VMLodParams.z, d - radius)) /
+        max(.000001, _VMLodParams.x * instanceStretch);
+    float own = Transition(c.error, c.triangleSpacing, lodParameters.x, lodParameters.y);
+    float parent = Transition(c.parentError, c.parentTriangleSpacing, lodParameters.x, lodParameters.y);
+    return c.type == 0 || (c.type == 1 && units < parent) ||
+        (c.type == 2 && own <= units && units < parent) || (c.type == 3 && own <= units);
+}
+bool HasCone(uint modelId)
+{
+    return _VMConeDataEnabled != 0 && _VMModelTable[modelId].boundsCenter.w > .5 &&
+        _VMWindPadding <= 0 && (_VMCullMode == 1 || _VMCullMode == 2);
+}
+bool CameraConeReject(uint clusterId, uint modelId, VMInstance instance)
+{
+    if (!HasCone(modelId)) return false;
+    return VMClusterConeReject(_VMCullingData[clusterId],
+        mul(instance.worldToObject, float4(_VMCameraPosition.xyz,1)).xyz,
+        mul((float3x3)instance.worldToObject, _VMCameraForward.xyz), _VMLodParams.y > .5, _VMCullMode);
+}
+void TightSphere(uint clusterId, uint modelId, VMInstance instance, VMCluster c, out float3 center, out float radius)
+{
+    // LOD uses shared group bounds; occlusion may use each cluster's tighter
+    // sphere, independently of whether its normal cone is valid or two-sided.
+    float4 sphere = float4(c.center,c.radius);
+    if (_VMModelTable[modelId].boundsCenter.w > .5) sphere = _VMCullingData[clusterId].centerRadius;
+    center = mul(instance.objectToWorld,float4(sphere.xyz,1)).xyz;
+    radius = sphere.w * instance.parameters.x + max(0,_VMWindPadding);
+}
+bool WorkOutsideFrustum(VMWorkBounds bounds, VMInstance instance)
+{
+    if (bounds.centerRadius.w < 0.0 || any(bounds.extents.xyz < 0.0) ||
+        !all(isfinite(bounds.centerRadius)) || !all(isfinite(bounds.extents.xyz)))
+        return false;
+
+    float3x3 objectAxes = (float3x3)instance.objectToWorld;
+    float3 center = mul(instance.objectToWorld, float4(bounds.centerRadius.xyz, 1.0)).xyz;
+    float radius = bounds.centerRadius.w * instance.parameters.x + max(0.0, _VMWindPadding);
+    // Account for cancellation in world/plane dot products, including large world positions.
+    float3 translation = float3(instance.objectToWorld[0].w, instance.objectToWorld[1].w, instance.objectToWorld[2].w);
+    float3 transformMagnitude = mul(abs(objectAxes), abs(bounds.centerRadius.xyz) + bounds.extents.xyz) + abs(translation);
+    if (!all(isfinite(center)) || !all(isfinite(transformMagnitude)) || !isfinite(radius) || radius < 0.0)
+        return false;
+
+    [unroll] for (uint p = 0; p < 6; p++)
+    {
+        float4 plane = _VMFrustumPlanes[p];
+        // Project the box of sphere centers onto this plane, then add the
+        // largest sphere radius using the same scale and wind as TightSphere.
+        float centerSupport = dot(abs(mul(plane.xyz, objectAxes)), bounds.extents.xyz);
+        float magnitude = dot(abs(plane.xyz), transformMagnitude) + abs(plane.w) + radius;
+        float guard = 0.0001 + magnitude * 0.00001;
+        float farthest = dot(plane, float4(center, 1.0)) + centerSupport + radius;
+        if (isfinite(farthest) && isfinite(guard) && farthest < -guard)
+            return true;
+    }
+    return false;
+}
+bool ShadowRay(float3 center, float radius, float3 direction)
+{
+    float enter=0, leave=3.402823466e+38;
+    [unroll] for(uint p=0;p<6;p++)
+    {
+        float d=dot(_VMShadowReceiverPlanes[p],float4(center,1))+radius;
+        float slope=dot(_VMShadowReceiverPlanes[p].xyz,direction);
+        if(slope>0) enter=max(enter,-d/slope);
+        else if(slope<0) leave=min(leave,-d/slope);
+        else if(d<0) return false;
+        if(enter>leave) return false;
+    }
+    return true;
+}
+bool ShadowVisible(uint clusterId,uint modelId,VMInstance instance,float3 center,float radius)
+{
+    if(_VMShadowLightCount==0 || _VMShadowLightCount>16) return true;
+    bool cone=HasCone(modelId);
+    radius+=max(.001,radius*.0001);
+    for(uint l=0;l<_VMShadowLightCount;l++)
+    {
+        float4 direction=_VMShadowLightDirections[l];
+        float4 light=_VMShadowLightPositionsRanges[l];
+        bool relevant=direction.w<.5 ? ShadowRay(center,radius,direction.xyz) :
+            distance(center,light.xyz)<=light.w+radius;
+        if(!relevant) continue;
+        if(!cone || !VMClusterConeReject(_VMCullingData[clusterId],
+            mul(instance.worldToObject,float4(light.xyz,1)).xyz,
+            mul((float3x3)instance.worldToObject,direction.xyz),direction.w<.5,_VMCullMode)) return true;
+    }
+    return false;
+}
+
+[numthreads(64,1,1)]
+void Select(uint3 group:SV_GroupID,uint lane:SV_GroupIndex)
+{
+    uint workId=group.x+_VMWorkItemOffset;
+    if(workId>=_VMWorkItemCount) return;
+    VMWorkItem work=_VMWorkItems[workId];
+    if (_VMDiagnosticModelMode != 0 && ((_VMDiagnosticModelMode > 0) != (work.modelId == (uint)_VMDiagnosticModelId))) return;
+    if (work.modelId < 64 && ((_VMDiagnosticExcludedModelBits[work.modelId >> 5] >> (work.modelId & 31)) & 1u) != 0) return;
+    [branch] if (_VMEnableEarlyWorkFrustum != 0)
+    {
+        if (lane == 0)
+        {
+            vmWorkOutsideFrustum = WorkOutsideFrustum(_VMWorkBounds[work.boundsIndex], _VMInstances[work.instanceId]) ? 1u : 0u;
+            if (vmWorkOutsideFrustum != 0) InterlockedAdd(_VMCounters[8], 1);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (vmWorkOutsideFrustum != 0) return;
+    }
+    if (lane >= work.count) return;
+    uint clusterId=work.clusterStart+lane, instanceId=work.instanceId, modelId=work.modelId;
+    VMCluster c=_VMClusters[clusterId]; VMInstance instance=_VMInstances[instanceId];
+    float3 center=mul(instance.objectToWorld,float4(c.center,1)).xyz;
+    float radius=c.radius*instance.parameters.x+max(0,_VMWindPadding);
+    if(!Selected(c,instance.parameters.x,_VMLodParameters[instanceId],center,radius,false)) return;
+    TightSphere(clusterId,modelId,instance,c,center,radius);
+    [unroll] for(uint p=0;p<6;p++) if(dot(_VMFrustumPlanes[p],float4(center,1)) < -radius)
+    { InterlockedAdd(_VMCounters[5],1); return; }
+    if(CameraConeReject(clusterId,modelId,instance)) { InterlockedAdd(_VMCounters[4],1); return; }
+    uint slot;
+    if(VMHiZSphereOccluded(center,radius))
+    {
+        InterlockedAdd(_VMCounters[1],1,slot);
+        if (slot < _VMListCapacity) _VMDeferredClusters[slot] = uint2(clusterId,instanceId);
+    }
+    else
+    {
+        InterlockedAdd(_VMCounters[0],1,slot);
+        if (slot < _VMListCapacity) _VMVisibleClusters[slot] = uint2(clusterId,instanceId);
+    }
+}
+
+[numthreads(64,1,1)]
+void Retest(uint3 id:SV_DispatchThreadID)
+{
+    uint index=id.x+id.y*65535u*64u;
+    if(index>=min(_VMCounters[1],_VMListCapacity)) return;
+    uint2 visible=_VMDeferredInput[index];
+    VMInstance instance=_VMInstances[visible.y]; uint modelId=_VMInstanceModelIds[visible.y];
+    VMCluster c=_VMClusters[visible.x]; float3 center; float radius;
+    TightSphere(visible.x,modelId,instance,c,center,radius);
+    if(VMHiZSphereOccluded(center,radius)) return;
+    uint slot;
+    InterlockedAdd(_VMCounters[2],1,slot);
+    uint offset = min(_VMCounters[0],_VMListCapacity);
+    if (slot < _VMListCapacity - offset)
+        _VMVisibleClusters[offset + slot] = visible;
+}
+
+[numthreads(1,1,1)]
+void PrepareRetest(uint3 id:SV_DispatchThreadID)
+{
+    uint groups=(min(_VMCounters[1],_VMListCapacity)+63u)/64u;
+    _VMRetestDispatchArguments[0]=min(65535u,max(1u,groups));
+    _VMRetestDispatchArguments[1]=max(1u,(groups+65534u)/65535u);
+    _VMRetestDispatchArguments[2]=1u;
+}
+
+[numthreads(1,1,1)]
+void BuildDrawArguments(uint3 id:SV_DispatchThreadID)
+{
+    _VMDrawArguments[1] = min(_VMCounters[_VMArgumentPhase], _VMListCapacity);
+    if (_VMArgumentPhase == 0)
+    {
+        _VMCounters[3] = _VMDrawArguments[1];
+        _VMCounters[6] = min(_VMCounters[1], _VMListCapacity);
+        _VMCounters[7] = _VMCounters[0] + _VMCounters[1] + _VMCounters[4] + _VMCounters[5];
+    }
+}
+
+[numthreads(1,1,1)]
+void BuildRetestedDrawArguments(uint3 id:SV_DispatchThreadID)
+{
+    uint early = min(_VMCounters[0], _VMListCapacity);
+    uint recovered = min(_VMCounters[2], _VMListCapacity - early);
+    _VMDrawArguments[1] = early + recovered;
+    _VMRecoveredArguments[1] = recovered;
+    _VMCounters[3] = early + recovered;
+    _VMCounters[6] = min(_VMCounters[1], _VMListCapacity) - recovered;
+}
+
+[numthreads(64,1,1)]
+void Shadow(uint3 group:SV_GroupID,uint lane:SV_GroupIndex)
+{
+    uint workId=group.x+_VMWorkItemOffset;
+    if(workId>=_VMWorkItemCount) return;
+    VMWorkItem work=_VMWorkItems[workId]; if(lane>=work.count) return;
+    uint clusterId=work.clusterStart+lane; VMCluster c=_VMClusters[clusterId]; VMInstance instance=_VMInstances[work.instanceId];
+    float3 center=mul(instance.objectToWorld,float4(c.center,1)).xyz;
+    float radius=c.radius*instance.parameters.x+max(0,_VMWindPadding);
+    if(!Selected(c,instance.parameters.x,_VMLodParameters[work.instanceId],center,radius,true)) return;
+    InterlockedAdd(_VMCounters[7],1);
+    TightSphere(clusterId,work.modelId,instance,c,center,radius);
+    if(!ShadowVisible(clusterId,work.modelId,instance,center,radius)) { InterlockedAdd(_VMCounters[4],1); return; }
+    uint slot;
+    InterlockedAdd(_VMCounters[3],1,slot);
+    if (slot < _VMListCapacity) _VMVisibleClusters[slot] = uint2(clusterId,work.instanceId);
+}

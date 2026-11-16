@@ -1,0 +1,19 @@
+#pragma kernel Cull
+#pragma target 5.0
+#include "VirtualMeshModelTypes.hlsl"
+#include "VirtualMeshModelOcclusion.hlsl"
+StructuredBuffer<VMInstance> _VMInstances;
+StructuredBuffer<uint> _VMImpostorCandidates;
+AppendStructuredBuffer<uint> _VMImpostorVisible;
+float4 _VMImpostorBoundsCenter, _VMImpostorBoundsExtents;
+uint _VMImpostorCandidateCount, _VMImpostorCandidateOffset;
+[numthreads(64,1,1)]
+void Cull(uint3 id:SV_DispatchThreadID)
+{
+    uint index=id.x+_VMImpostorCandidateOffset;
+    if(index>=_VMImpostorCandidateCount)return;
+    uint instanceId=_VMImpostorCandidates[index]; VMInstance instance=_VMInstances[instanceId];
+    float3 center=mul(instance.objectToWorld,float4(_VMImpostorBoundsCenter.xyz,1)).xyz;
+    float radius=length(_VMImpostorBoundsExtents.xyz)*instance.parameters.x;
+    if(!VMHiZSphereOccluded(center,radius))_VMImpostorVisible.Append(instanceId);
+}

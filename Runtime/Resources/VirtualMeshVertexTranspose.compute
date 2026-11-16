@@ -1,0 +1,27 @@
+// Offline prototype only. Source and destination fields are uint so no float
+// operation can canonicalize NaNs, signed zero, subnormals or infinities.
+#pragma kernel Transpose
+#pragma target 4.5
+struct Vertex72 { uint3 position; uint3 normal; uint4 tangent; uint2 uv0; uint2 uv1; uint4 color; };
+struct Hot24 { uint3 position; uint2 uv0; uint colorR; };
+struct Normal28 { uint3 normal; uint4 tangent; };
+struct Cold20 { uint2 uv1; uint3 colorGBA; };
+StructuredBuffer<Vertex72> _Source;
+RWStructuredBuffer<Hot24> _Hot;
+RWStructuredBuffer<Normal28> _Normal;
+RWStructuredBuffer<Cold20> _Cold;
+uint _Count;
+uint _Destination;
+[numthreads(128, 1, 1)]
+void Transpose(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Count) return;
+    Vertex72 source = _Source[id.x];
+    Hot24 hot; hot.position = source.position; hot.uv0 = source.uv0; hot.colorR = source.color.x;
+    Normal28 normal; normal.normal = source.normal; normal.tangent = source.tangent;
+    Cold20 cold; cold.uv1 = source.uv1; cold.colorGBA = source.color.yzw;
+    uint destination = _Destination + id.x;
+    _Hot[destination] = hot;
+    _Normal[destination] = normal;
+    _Cold[destination] = cold;
+}

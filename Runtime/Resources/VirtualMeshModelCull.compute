@@ -1,0 +1,110 @@
+#pragma kernel Cull
+#pragma target 4.5
+#include "VirtualMeshModelTypes.hlsl"
+
+StructuredBuffer<VMCluster> _VMClusters;
+StructuredBuffer<VMInstance> _VMInstances;
+AppendStructuredBuffer<uint2> _VMVisibleClusters;
+uint _VMClusterCount;
+uint _VMClusterOffset;
+uint _VMInstanceCount;
+uint _VMSubmesh;
+uint _VMDispatchOffset;
+uint _VMShadowPass;
+float4 _VMFrustumPlanes[6];
+float4 _VMCameraPosition;
+float4 _VMCameraForward;
+float4 _VMLodParams; // pixel projection scale, orthographic, near clip, reserved
+float _VMWindPadding;
+// Zero disables the extra test for older standalone compute callers. Runtime supplies
+// the complete light list, or disables the optimization when the array would overflow.
+uint _VMShadowLightCount;
+float4 _VMShadowReceiverPlanes[6];
+float4 _VMShadowLightDirections[16]; // xyz ray direction; w=0 directional, w=1 punctual
+float4 _VMShadowLightPositionsRanges[16];
+
+bool ShadowRayReachesReceivers(float3 center, float radius, float3 direction)
+{
+    float enter = 0.0;
+    float leave = 3.402823466e+38;
+    [unroll] for (uint plane = 0; plane < 6; plane++)
+    {
+        float4 p = _VMShadowReceiverPlanes[plane];
+        float signedDistance = dot(p.xyz, center) + p.w + radius;
+        float slope = dot(p.xyz, direction);
+        if (slope > 0.0) enter = max(enter, -signedDistance / slope);
+        else if (slope < 0.0) leave = min(leave, -signedDistance / slope);
+        else if (signedDistance < 0.0) return false;
+        if (enter > leave) return false;
+    }
+    return true;
+}
+
+bool CanCastShadow(float3 center, float radius)
+{
+    if (_VMShadowLightCount == 0 || _VMShadowLightCount > 16) return true;
+    // Expand instead of shrinking near plane intersections due to float cancellation.
+    radius += max(0.001, radius * 0.0001);
+    for (uint light = 0; light < _VMShadowLightCount; light++)
+    {
+        float4 direction = _VMShadowLightDirections[light];
+        if (direction.w < 0.5)
+        {
+            if (ShadowRayReachesReceivers(center, radius, direction.xyz)) return true;
+        }
+        else
+        {
+            float4 positionRange = _VMShadowLightPositionsRanges[light];
+            float range = positionRange.w + radius;
+            float3 offset = center - positionRange.xyz;
+            // A point/spot cone is deliberately not approximated here. The light range
+            // sphere is conservative for both and Unity performs the final slice cull.
+            if (dot(offset, offset) <= range * range) return true;
+        }
+    }
+    return false;
+}
+
+float TransitionThreshold(float error, float spacing, float pixelError, float targetPixels)
+{
+    float regular = error / max(0.000001, pixelError);
+    if (targetPixels <= 0 || spacing <= 0) return regular;
+    return min(regular, max(regular * 0.5, spacing / targetPixels));
+}
+
+[numthreads(64, 1, 1)]
+void Cull(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint id = dispatchId.x + _VMDispatchOffset;
+    uint instanceId = id / _VMClusterCount;
+    if (instanceId >= _VMInstanceCount) return;
+    uint clusterId = _VMClusterOffset + id % _VMClusterCount;
+    VMCluster c = _VMClusters[clusterId];
+    if (c.submesh != _VMSubmesh) return;
+    VMInstance instance = _VMInstances[instanceId];
+    float3 center = mul(instance.objectToWorld, float4(c.center, 1)).xyz;
+    float radius = c.radius * instance.parameters.x + max(0, _VMWindPadding);
+    if (_VMShadowPass == 0)
+    {
+        [unroll] for (uint plane = 0; plane < 6; plane++)
+            if (dot(_VMFrustumPlanes[plane], float4(center, 1)) < -radius) return;
+    }
+
+    // View depth is conservative at screen edges; Euclidean distance can over-simplify there.
+    float cameraDistance = _VMShadowPass != 0 ? distance(center, _VMCameraPosition.xyz) :
+        dot(center - _VMCameraPosition.xyz, _VMCameraForward.xyz);
+    float distanceToSurface = max(_VMLodParams.z, cameraDistance - radius);
+    float modelUnitsPerPixel =
+        (_VMLodParams.y > 0.5 ? 1.0 : distanceToSurface) /
+        max(0.000001, _VMLodParams.x * instance.parameters.x);
+    float current = TransitionThreshold(c.error, c.triangleSpacing, instance.parameters.y, instance.parameters.w);
+    float parent = TransitionThreshold(c.parentError, c.parentTriangleSpacing, instance.parameters.y, instance.parameters.w);
+    bool selected = c.type == 0 || (c.type == 1 && modelUnitsPerPixel < parent) ||
+        (c.type == 2 && current <= modelUnitsPerPixel && modelUnitsPerPixel < parent) ||
+        (c.type == 3 && current <= modelUnitsPerPixel);
+    if (!selected) return;
+    // The hierarchy can contain several times more stored clusters than the chosen
+    // LOD. Only the selected level needs the more expensive light-ray clip.
+    if (_VMShadowPass != 0 && !CanCastShadow(center, radius)) return;
+    _VMVisibleClusters.Append(uint2(clusterId, instanceId));
+}
