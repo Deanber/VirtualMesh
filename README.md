@@ -29,11 +29,6 @@
 
 通用路径支持 URP Lit/Unlit。任意自定义材质需要适配，不能仅换 Renderer Feature 就获得相同外观。
 
-## 可选森林材质适配
-
-Package Manager 的 **Samples** 中可导入 **ElectricDreams material adapters**。它包含对应的源 shader、VM shader 与依赖 HLSL，保留 Foliage/Hornbeam 的 MaterialDepth/resolve 适配。核心 `Virtual Mesh/Model Lit` 不提供完全相同的森林 resolve 路径。
-
-示例只有 shader 源码，不包含模型、纹理、材质资产、森林场景或批量场景工具。需要自行提供符合属性约定的材质和贴图；已有同名适配器的工程不要重复导入。详见[示例说明](Samples~/ElectricDreamsAdapters/README.md)。
 
 ## 当前能力与边界
 
@@ -46,10 +41,5 @@ Package Manager 的 **Samples** 中可导入 **ElectricDreams material adapters*
 ## 文档与来源
 
 本次整理通过 Runtime（Editor/Player 条件）与 Editor 三项离线 C# 编译，并检查了 114 处 shader include 路径。没有在全新 Unity 项目中重跑导入、烘焙、shader 编译或性能测试。
-
-- [模型资产、API 与支持范围](Documentation~/model-assets.md)
-- [实现说明](Documentation~/implementation.md)
-- [术语](Documentation~/glossary.md)
-- [更新记录](CHANGELOG.md)
 
 源自 [Unity Virtual Mesh](https://github.com/Unity-Technologies/com.unity.virtualmesh) 示例。保留原始 [Unity Companion License 声明](LICENSE.md) 与[第三方声明](Third%20Party%20Notices.md)；不是 Unity 官方的新发布版本。
